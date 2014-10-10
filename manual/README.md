@@ -9,11 +9,12 @@ NOTE: this manual does not include rods lenghts because sizes can be
 
 To compile this manual into one PDF file you can use this Makefile. Maybe you
 need some extra packages:
-
+'''
 # apt-get install librsvg2-bin pdftk
-
+'''
 And then, just run make:
-
+'''
 $ make
+'''
 
 Enjoy!
