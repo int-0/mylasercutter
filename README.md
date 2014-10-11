@@ -1,5 +1,7 @@
 # Mylasercutter project
 
+![](https://github.com/int-0/mylasercutter/raw/master/cnc_view.png)
+
 This project is a CNC machine similar to reprap 3D printers. Hardware is
 designed by me using FreeCAD and software is a fork of other existing
 projects: [Sprinter](https://github.com/kliment/Sprinter) and [Pronterface](https://github.com/kliment/Printrun).
