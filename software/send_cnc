@@ -1,0 +1,481 @@
+#!/usr/bin/env python
+
+#
+# You can use this program to send gcode file to any serial device
+# but it has been tested only in reprap-like printers.
+#
+# This program is based in printcore.py, included in Pronterface program
+# check https://github.com/kliment/Printrun for more info about Pronterface/Printrun
+#
+# Released under the terms of GPLv3: http://www.gnu.org/copyleft/gpl.html 
+#
+
+import threading
+import traceback
+import platform
+import argparse
+import logging
+import select
+import serial
+import Queue
+import time
+import sys
+import os
+
+from functools import wraps
+
+logging.basicConfig(level=logging.DEBUG)
+WRN = logging.warning
+INF = logging.info
+ERR = logging.error
+DEB = logging.debug
+
+DEFAULT_SPEED = 115200
+_SERIAL_TIMEOUT = 0.25
+
+_GREETINGS = ['start', 'Grbl ']
+
+
+def locked(f):
+    @wraps(f)
+    def inner(*args, **kw):
+        with inner.lock:
+            return f(*args, **kw)
+    inner.lock = threading.Lock()
+    return inner
+
+
+def _set_hup(port, state):
+    """Controls the HUPCL"""
+    if platform.system() != "Linux":
+        return
+    os.system('stty -F %s %shup' % (
+        port,
+        ('' if state else '-')))
+
+
+class PrinterNotConnected(Exception):
+    def __init__(self, port='null'):
+        self.__port = port
+
+    def __str__(self):
+        return 'Printer not connected to "%s"' % self.__port
+
+
+class ConnectionError(Exception):
+    def __init__(self, details=None):
+        self.__details = details
+
+    def __str__(self):
+        return 'Connection to printer error%s' % (
+            '' if self.__details is None else ' (%s)' % self.__details)
+
+
+class RawPrinter(object):
+    def __init__(self, port, speed=DEFAULT_SPEED):
+
+        self.__port = port
+        self.__speed = speed
+
+        self.__printer = None
+        self.__printer_online = False
+
+        self.__clear = False
+
+        self.__primary_queue = Queue.Queue(0)
+        self.__main_queue = None
+        self.__queue_index = 0
+        self.__print_thread = None
+        self.__printing = False
+        self.__resendfrom = -1
+        self.__lineno = 0
+
+        self.__stop_read_thread = True
+        self.read_thread = None
+        self.__stop_send_thread = True
+        self.send_thread = None
+
+        self.__sent_buf = {}
+        self.__writefailures = 0
+
+    def _start_sender(self):
+        DEB('Starting sender thread...')
+        self.__stop_send_thread = False
+        self.send_thread = threading.Thread(target = self._sender)
+        self.send_thread.start()
+
+    def _stop_sender(self):
+        if self.send_thread:
+            DEB('Stopping sender thread...')
+            self.__stop_send_thread = True
+            self.send_thread.join()
+            self.send_thread = None
+
+    @property
+    def port(self):
+        return self.__port
+
+    @property
+    def port_speed(self):
+        return self.__speed
+
+    @property
+    def printing(self):
+        return self.__printing
+
+    @locked
+    def open(self):
+        if self.connected:
+            self.close()
+        self.__writefailures = 0
+        _set_hup(self.port, False)
+        try:
+            self.__printer = serial.Serial(port=self.port,
+                                           baudrate=self.port_speed,
+                                           timeout=_SERIAL_TIMEOUT)
+            DEB('Printer connected')
+        except serial.SerialException as e:
+            ERR('Could not connect to %s at baudrate %s: (%s)' % (self.port, self.port_speed, e))
+            self.__printer = None
+            return
+        except IOError as e:
+            ERR('Could not connect to %s at baudrate %s: (%s)' % (self.port, self.port_speed, e))
+            self.__printer = None
+            return
+        DEB('Reader thread OK')
+        self.__stop_read_thread = False
+        self.read_thread = threading.Thread(target = self._listen)
+        self.read_thread.start()
+        self._start_sender()
+
+    @locked
+    def close(self):
+        if self.connected:
+            if self.read_thread:
+                DEB('Stopping reader thread...')
+                self.__stop_read_thread = True
+                self.read_thread.join()
+                self.read_thread = None
+            if self.__print_thread:
+                DEB('Stopping printer thread...')
+                self.__printing = False
+                self.__print_thread.join()
+            self._stop_sender()
+            try:
+                self.__printer.close()
+                DEB('Printer disconnected')
+            except OSError:
+                pass
+        self.__printer = None
+        self.__printer_online = False
+
+    @property
+    def connected(self):
+        return self.__printer is not None
+
+    @property
+    def online(self):
+        return self.__printer_online
+
+    def __checksum(self, command):
+        return reduce(lambda x, y: x ^ y, map(ord, command))
+
+    def __assert_isconnected(self):
+        if not self.connected:
+            raise PrinterNotConnected(self.port)
+
+    def __wait_printer(self):
+        while self.connected and self.printing and not self.__clear:
+            time.sleep(0.001)
+        return True
+
+    def reset(self):
+        self.__assert_isconnected()
+        self.__printer.setDTR(1)
+        time.sleep(0.2)
+        self.__printer.setDTR(0)
+
+    def _readline(self):
+        self.__assert_isconnected()
+        try:
+            line = self.__printer.readline()
+            if len(line) > 1:
+                DEB('RX: %s' % repr(line))
+            return line
+        except select.SelectError as e:
+            if 'Bad file descriptor' in e.args[1]:
+                WRN("Can't read from port (disconnected?) (SelectError {0}): {1}".format(e.errno,
+                                                                                         e.strerror))
+                return None
+            else:
+                raise ConnectionError('SelectError ({0}): {1}'.format())
+        except serial.SerialException as e:
+            WRN("Can't read from printer (disconnected?) (SerialException): {0}".format(str(e)))
+            return None
+        except OSError as e:
+            if e.errno == errno.EAGAIN:  # Not a real error, no data was available
+                return ''
+            WRN("Can't read from port (disconnected?) (OS Error {0}): {1}".format(e.errno,
+                                                                                  e.strerror))
+            return None
+
+    def _print(self):
+        self._stop_sender()
+        try:
+            while self.printing and self.__printer and self.__printer_online:
+                self._sendnext()
+            self.sentlines = {}
+        except:
+            ERR('Print thread died due to the following error: %s' % traceback.format_exc())
+        finally:
+            self.__print_thread = None
+            self._start_sender()
+
+    def _sendnext(self):
+        self.__assert_isconnected()
+        self.__wait_printer()
+
+        self.__clear = False
+        if not (self.printing and self.__printer and self.__printer_online):
+            self.__clear = True
+            DEB('Printer status not ready')
+            return
+
+        if self.__resendfrom < self.__lineno and self.__resendfrom > -1:
+            DEB('Resending command')
+            self._send(self.__sent_buf[self.__resendfrom], self.__resendfrom, False)
+            self.__resendfrom += 1
+            return
+        self.__resendfrom = -1
+
+        if not self.__primary_queue.empty():
+            DEB('Command from primary queue')
+            self._send(self.__primary_queue.get_nowait())
+            self.__primary_queue.task_done()
+            return
+
+        if self.printing and self.__queue_index < len(self.__main_queue):
+            line = self.__main_queue.get_lineno(self.__queue_index)
+            gline = self.__main_queue.get_gcode(line)
+            DEB('Main queue (%s)=%s' % (self.__queue_index, repr(gline)))
+            if gline is None:
+                self.__queue_index += 1
+                self.__clear = True
+                return
+            if gline:
+                self._send(gline, self.__lineno, True)
+                self.__lineno += 1
+            else:
+                self.__clear = True
+            self.__queue_index += 1
+        else:
+            DEB('No more to print!')
+            self.__printing = False
+            self.__clear = True
+            # Query status if not printing
+            self.__queue_index = 0
+            self.__lineno = 0
+            self._send('M110', -1, True)
+
+    def _send(self, command, lineno = 0, calcchecksum = False):
+        self.__assert_isconnected()
+        # Only add checksums if over serial (tcp does the flow control itself)
+        if calcchecksum:
+            prefix = "N%s %s" %(lineno, command)
+            command = '%s*%s' % (prefix, self.__checksum(prefix))
+            if "M110" not in command:
+                self.__sent_buf[lineno] = command
+        try:
+            out = '%s\n' % command
+            DEB('TX: %s' % repr(out))
+            self.__printer.write(out)
+            self.__writefailures = 0
+        except serial.SerialException as e:
+            WRN("Can't write to printer (disconnected?) (SerialException): {0}".format(str(e)))
+            self.__writefailures += 1
+        except RuntimeError as e:
+            WRN('Connection broken, disconnected. ({0}): {1}'.format(e.errno, e.strerror))
+            self.__writefailures += 1
+
+    def _listen_can_continue(self):
+        return (not self.__stop_read_thread
+                and self.__printer
+                and self.__printer.isOpen())
+
+    def _listen_until_online(self):
+        while not self.__printer_online and self._listen_can_continue():
+            self._send("M105")
+            if self.__writefailures >= 4:
+                ERR('Aborting connection attempt after 4 failed writes.')
+                return
+            empty_lines = 0
+            while self._listen_can_continue():
+                line = self._readline()
+                if line is None: break  # connection problem
+                # workaround cases where M105 was sent before printer Serial
+                # was online an empty line means read timeout was reached,
+                # meaning no data was received thus we count those empty lines,
+                # and once we have seen 15 in a row, we just break and send a
+                # new M105
+                # 15 was chosen based on the fact that it gives enough time for
+                # Gen7 bootloader to time out, and that the non received M105
+                # issues should be quite rare so we can wait for a long time
+                # before resending
+                if not line:
+                    empty_lines += 1
+                    if empty_lines == 15: break
+                else: empty_lines = 0
+                if line.startswith(tuple(_GREETINGS)) \
+                   or line.startswith('ok') or "T:" in line:
+                    self.__printer_online = True
+                    DEB('Printer is online')
+                    return
+
+    def _listen(self):
+        self.__clear = True
+        self._listen_until_online()
+        while self._listen_can_continue():
+            line = self._readline()
+            if line is None:
+                break
+            if line.startswith('DEBUG_'):
+                DEB('Printer_%s' % line)
+            if line.startswith(tuple(_GREETINGS)) or line.startswith('ok'):
+                self.__clear = True
+            if line.startswith('ok') and "T:" in line:
+                # callback for temp, status, whatever
+                INF('Printer stats: %s' % line)
+            elif line.startswith('Error'):
+                WRN('Printer error: %s' % line)
+            if line.lower().startswith("resend") or line.startswith("rs"):
+                INF('Printer ask for resend')
+                for haystack in ["N:", "N", ":"]:
+                    line = line.replace(haystack, " ")
+                linewords = line.split()
+                while len(linewords) != 0:
+                    try:
+                        toresend = int(linewords.pop(0))
+                        self.__resendfrom = toresend
+                        break
+                    except:
+                        pass
+                self.__clear = True
+        self.__clear = True
+
+    def _sender(self):
+        while not self.__stop_send_thread:
+            try:
+                command = self.__primary_queue.get(True, 0.1)
+            except Queue.Empty:
+                continue
+            self.__wait_printer()
+            self._send(command)
+            self.__wait_printer()
+
+    def send(self, command):
+        if self.online:
+            if self.printing:
+                self.__main_queue.append(command)
+            else:
+                self.__primary_queue.put_nowait(command)
+        else:
+            ERR('Not connected to printer.')
+
+    def send_now(self, command):
+        if self.online:
+            self.__primary_queue.put_nowait(command)
+        else:
+            ERR('Not connected to printer.')
+
+    def startprint(self, gcode):
+        self.__assert_isconnected()
+        if self.printing or not self.online:
+            return False
+        self.__main_queue = gcode
+        self.__queueindex = 0
+        self.__printing = True
+        self.__lineno = 0
+        self.__resendfrom = -1
+        self._send("M110", -1, True)
+        if not gcode or not gcode.lines:
+            return True
+        self.__clear = False
+        self.__print_thread = threading.Thread(target = self._print)
+        self.__print_thread.start()
+        return True
+
+class GCode(object):
+    def __init__(self, txt):
+        self.__gcode = self.__clean(txt)
+
+    @property
+    def lines(self):
+        return self.__gcode
+
+    def __clean(self, txt):
+        clear = []
+        for line in txt.splitlines():
+            line = line.strip()
+            if ';' in line:
+                line = line[:line.find(";")]
+            if line == '':
+                continue
+            clear.append(line)
+        return clear
+
+    def append(self, gcode):
+        self.__gcode.append(self.__clean(gcode))
+
+    def get_lineno(self, index):
+        return min(index, len(self))
+
+    def get_gcode(self, index):
+        if index in range(len(self)):
+            return self.__gcode[index]
+        return None
+
+    def __len__(self):
+        return len(self.__gcode)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Send gcode file to a reprap printer.')
+    parser.add_argument('gcode_file', metavar='FILE', type=str,
+                        help='Filename to send')
+    parser.add_argument('-d', '--device', dest='device',
+                        metavar='DEVICE', type=str, default='/dev/ttyACM0',
+                        help='Destination serial device [default: %(default)s]')
+    parser.add_argument('-b', '--baud-rate', dest='bauds',
+                        metavar='SPEED', type=int, default=DEFAULT_SPEED,
+                        help='Serial device baud rate [default: %(default)s]')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.device):
+        print 'ERROR: device not found: %s' % args.device
+        sys.exit(-1)
+    if not os.path.exists(args.gcode_file):
+        print 'ERROR: file not found: %s' % args.gcode_file
+        sys.exit(-1)
+
+    with open(args.gcode_file, 'r') as f:
+        program = GCode(f.read())
+
+    printer = RawPrinter(args.device, args.bauds)
+
+    printer.open()
+    INF('Waiting for printer...')
+    while not printer.online:
+        time.sleep(0.1)
+    INF('Sending commands...')
+    if printer.startprint(program):
+        INF('Waiting for termination...')
+        while printer.printing:
+            try:
+                time.sleep(0.5)
+            except KeyboardInterrupt:
+                WRN('Send file break by the user')
+                break
+        INF('Closing connection...')
+    else:
+        ERR('Cannot start printing')
+    printer.close()
