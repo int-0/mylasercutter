@@ -28,10 +28,6 @@ extern "C" void __cxa_pure_virtual();
 #define enable_y() ;
 #define disable_y() ;
 #endif
-#define enable_z() {}
-#define disable_z() {}
-#define enable_e() {}
-#define disable_e() {}
 
 #define X_AXIS 0
 #define Y_AXIS 1

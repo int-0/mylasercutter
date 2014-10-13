@@ -59,8 +59,8 @@ void __cxa_pure_virtual(){};
 
 //Custom M Codes
 // M42  - Set output on free pins, on a non pwm pin (over pin 13 on an arduino mega) use S255 to turn it on and S0 to turn it off. Use P to decide the pin (M42 P23 S255) would turn pin 23 on
-// M52  - Enable Laser
-// M53  - Disable Laser
+// M3   - Enable Laser
+// M5   - Disable Laser
 // M82  - Set E codes absolute (default)
 // M83  - Set E codes relative while in Absolute Coordinates (G90) mode
 // M84  - Disable steppers until next move, 
@@ -687,6 +687,14 @@ FORCE_INLINE void process_commands()
     
     switch( (int)code_value() ) 
     {
+      case 3:
+	st_synchronize();
+	WRITE(LASER_PIN,HIGH);
+        break;
+      case 5:
+	st_synchronize();
+	WRITE(LASER_PIN,LOW);
+        break;
       case 42: //M42 -Change pin status via gcode
         if (code_seen('S'))
         {
@@ -714,14 +722,6 @@ FORCE_INLINE void process_commands()
           }
         }
         break;
-      case 52:
-	st_synchronize();
-	WRITE(LASER_PIN,HIGH);
-        break;
-      case 53:
-	st_synchronize();
-	WRITE(LASER_PIN,LOW);
-        break;
       case 82:
         axis_relative_modes[3] = false;
         break;
@@ -738,15 +738,11 @@ FORCE_INLINE void process_commands()
         {
           enable_x(); 
           enable_y(); 
-          enable_z(); 
-          enable_e(); 
         }
         else
         { 
           disable_x(); 
           disable_y(); 
-          disable_z(); 
-          disable_e(); 
         }
         break;
       case 85: // M85
@@ -1054,8 +1050,6 @@ FORCE_INLINE void kill()
   
   disable_x();
   disable_y();
-  disable_z();
-  disable_e();
   
   if(PS_ON_PIN > -1) pinMode(PS_ON_PIN,INPUT);
   
@@ -1069,8 +1063,6 @@ FORCE_INLINE void manage_inactivity(byte debug)
   { 
     disable_x(); 
     disable_y(); 
-    disable_z(); 
-    disable_e(); 
   }
   check_axes_activity();
 }
@@ -1431,7 +1423,6 @@ void check_axes_activity() {
   }
   if((DISABLE_X) && (x_active == 0)) disable_x();
   if((DISABLE_Y) && (y_active == 0)) disable_y();
-  if((DISABLE_E) && (e_active == 0)) disable_e();
 }
 
 
@@ -1514,22 +1505,10 @@ void plan_buffer_line(float x, float y, float z, float e, float feed_rate)
     enable_y();
     delayMicroseconds(DELAY_ENABLE);
   }
-  if(block->steps_z != 0)
-  {
-    enable_z();
-    delayMicroseconds(DELAY_ENABLE);
-  }
-  if(block->steps_e != 0)
-  {
-    enable_e();
-    delayMicroseconds(DELAY_ENABLE);
-  }
  #else
   //enable active axes
   if(block->steps_x != 0) enable_x();
   if(block->steps_y != 0) enable_y();
-  if(block->steps_z != 0) enable_z();
-  if(block->steps_e != 0) enable_e();
  #endif 
  
   if (block->steps_e == 0) {
